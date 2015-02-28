@@ -461,29 +461,87 @@ char buf[MAX_BUF];
 /// Buffer containing modified packet or datagram
 char b2[MAX_BUF];
 
+const char *proxy_str = "PROXY TCP4";
+
+int last_packet_was_proxy = 0;
+int last_packet_was_only_proxy = 0;
+
+#define REWRITE 0
+#define DROP_EMPTY_PACKETS 0
+#define MERGE_PROXY_ONLY_PACKETS 0
+
 /// Applies the rules to global buffer buf.
 /// @param siz useful size of the data in buf.
 /// @param live TTL state of current connection.
 int sed_the_buffer(int siz, int* live) {
-  int i=0,j=0;
+  int i=0;//,j=0;
   int newsize=0;
   int changes=0;
   int gotchange=0;
+
+  int this_packet_was_proxy = 0;
+  last_packet_was_only_proxy = 0;
+
   for (i=0;i<siz;) {
     gotchange=0;
-    for (j=0;j<rules;j++) {
-      if ((!memcmp(&buf[i],rule[j].from,rule[j].fs)) && (live[j]!=0)) {
-        changes++;
-        gotchange=1;
-        printf("    Applying rule s/%s/%s...\n",rule[j].forig,rule[j].torig);
-        live[j]--;
-        if (live[j]==0) printf("    (rule just expired)\n");
-        memcpy(&b2[newsize],rule[j].to,rule[j].ts);
-        newsize+=rule[j].ts;
-        i+=rule[j].fs;
-        break;
+
+    if (!memcmp(&buf[i], proxy_str, strlen(proxy_str)) && (live[0] != 0)) {
+      char *newline = strstr(&buf[i], "\r");
+      if (!newline) {
+        printf("Couldn't find newline after PROXY TCP4!\n");
+      } else {
+        printf("\n\n******* PROXY PACKET OF SIZE %d *******\n\n", siz);
+
+        if (REWRITE) {
+          ++changes;
+          gotchange = 1;
+          --live[0];
+        }
+
+        printf("  Applying proxy protocol rule.\n");
+        if (live[0] == 0) printf("    (Rule has just expired)\n");
+        int proxy_start = i;
+        int proxy_end = proxy_start + (newline - &buf[i]) + 2;
+
+        if (REWRITE) {
+          i = proxy_end;
+        }
+
+        printf("\n\n NOT ACTUALLY STRIPPING PROXY PROTOCOL HEADER \n\n");
+
+        printf("    Skipped %d bytes.\n", proxy_end - proxy_start);
+        char temp = buf[proxy_end];
+        buf[proxy_end] = '\0';
+        printf("    Matched string was: %s\n", &buf[proxy_start]);
+        buf[proxy_end] = temp;
+        printf("    ASCII codes of last two plus one chars of header: %d, %d, %d\n",
+               buf[proxy_end - 2], buf[proxy_end - 1], buf[proxy_end]);
+        int idx = 0;
+        for (idx = proxy_end + 1; idx < siz && idx - proxy_end < 10; ++idx) {
+          printf("%d, ", buf[idx]);
+        }
+        printf("\n");
+
+        if (proxy_end - proxy_start == siz)
+          last_packet_was_only_proxy = 1;
       }
+      this_packet_was_proxy = 1;
+      last_packet_was_proxy = 1;
     }
+
+    /* for (j=0;j<rules;j++) { */
+    /*   if ((!memcmp(&buf[i],rule[j].from,rule[j].fs)) && (live[j]!=0)) { */
+    /*     changes++; */
+    /*     gotchange=1; */
+    /*     printf("    Applying rule s/%s/%s...\n",rule[j].forig,rule[j].torig); */
+    /*     live[j]--; */
+    /*     if (live[j]==0) printf("    (rule just expired)\n"); */
+    /*     memcpy(&b2[newsize],rule[j].to,rule[j].ts); */
+    /*     newsize+=rule[j].ts; */
+    /*     i+=rule[j].fs; */
+    /*     break; */
+    /*   } */
+    /* } */
     if (!gotchange) {
       b2[newsize]=buf[i];
       if (isprint(buf[i])) 
@@ -495,6 +553,18 @@ int sed_the_buffer(int siz, int* live) {
       if (i%80 == 0) printf("\n");
     }
   }
+
+  if (!changes) {
+    if (last_packet_was_proxy && !this_packet_was_proxy) {
+      printf("\n\n **** First bytes after proxy packet:\n\n");
+      int idx;
+      for (idx = 0; idx < siz && idx < 10; ++idx) {
+        printf("      %d, ", buf[idx]);
+      }
+      last_packet_was_proxy = 0;
+    }
+  }
+
   if (!changes) printf("[*] Forwarding untouched packet of size %d.\n",siz);
   else printf("[*] Done %d replacements, forwarding packet of size %d (orig %d).\n",
               changes,newsize,siz);
@@ -552,6 +622,9 @@ void client2server_sed(struct tracker_s * conn) {
     b2server_sed(conn, rd);
 }
 
+char *deferred_packet = NULL;
+int deferred_packet_size = 0;
+
 /// Send the content of global buffer b2 to the server as packet or datagram.
 /// @param conn connection giving the sockets to use.
 /// @param rd   size of b2 content.
@@ -559,11 +632,55 @@ void b2server_sed(struct tracker_s * conn, ssize_t rd) {
     if (rd>0) {
       printf("[+] Caught client -> server packet.\n");
       rd=sed_the_buffer(rd, conn->live);
+
+      if (DROP_EMPTY_PACKETS && rd == 0) {
+        return;
+      }
+
+      if (MERGE_PROXY_ONLY_PACKETS &&
+          last_packet_was_proxy &&
+          last_packet_was_only_proxy &&
+          deferred_packet == NULL) {
+        printf(" Deferring proxy-only packet %zd!\n", rd);
+        deferred_packet = malloc(rd);
+        memcpy(deferred_packet, b2, rd);
+        deferred_packet_size = rd;
+        return;
+      }
+
       conn->time = now;
-      if (write(conn->fsock,b2,rd)<=0) {
+
+      char *merged_buffer = NULL;
+      char *send_buffer = b2;
+      int send_size = rd;
+
+      if (deferred_packet) {
+        send_size = deferred_packet_size + rd;
+        merged_buffer = malloc(send_size);
+        send_buffer = merged_buffer;
+        memcpy(merged_buffer, deferred_packet, deferred_packet_size);
+        memcpy(merged_buffer + deferred_packet_size, b2, rd);
+        free(deferred_packet);
+        deferred_packet = NULL;
+        deferred_packet_size = 0;
+
+        printf(" Sending merged packet!: \n");
+        int i;
+        for (i = 0; i < send_size; ++i) {
+          printf("%c", send_buffer[i]);
+        }
+        printf("\n");
+      }
+
+      printf(" Sending %u bytes\n", send_size);
+
+      if (write(conn->fsock, send_buffer, send_size) <= 0) {
         DBG("[!] server disconnected. (wr)\n");
         conn->state = DISCONNECTED;
       }
+
+      free(merged_buffer);
+      merged_buffer = NULL;
     }
 }
 
